@@ -10,7 +10,7 @@ I trained an LSTM(just one layer) for 420 epochs, and it performed quite well, y
 
 It's such a basic model and have a lot of room for improvement. If you have any suggestions, please contact me so that I can learn from you and make it better.
 
-If you're also learning dl or think it's interesting, please give a star and here is my next project - a English to Spanish translator using Encoder-Decoder and Attention model, Github: 
+If you're also learning dl or think it's interesting, please give a star and here is my next project - a English to Spanish translator using Encoder-Decoder and Attention model, at https://github.com/Ariza-Ding/English-Spanish-translator
 
 # How to use
 
