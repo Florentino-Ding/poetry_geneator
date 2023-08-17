@@ -1,8 +1,7 @@
 import os
 import sys
-import math
+from typing import Optional
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,12 +9,329 @@ from torch.cuda.amp.autocast_mode import autocast
 from torch.cuda.amp.grad_scaler import GradScaler
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard.writer import SummaryWriter
-from torch.profiler import profile, record_function, ProfilerActivity
 from tqdm import tqdm, trange
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(BASE_DIR)
 
-class PoetryDataSet(Dataset):
-    def __init__(self, poet_file, max_len=None):
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+class dot_product_attention(nn.Module):
+    def __init__(
+        self,
+        dim_model: int,
+        dim_key: int,
+        **kwargs,
+    ) -> None:
+        super(dot_product_attention, self).__init__(**kwargs)
+        self.embed_dim = dim_model
+        self.embed2query = nn.Linear(dim_model, dim_key, bias=False)
+        self.embed2key = nn.Linear(dim_model, dim_key, bias=False)
+        self.embed2value = nn.Linear(dim_model, dim_model, bias=False)
+        self.softmax = F.softmax
+
+    def forward(self, query, key, value, mask: Optional[torch.Tensor] = None):
+        query = self.embed2query(query)
+        key = self.embed2key(key)
+        value = self.embed2value(value)
+
+        scores = torch.matmul(query, key.transpose(-2, -1)) / np.sqrt(self.embed_dim)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+        attention_weights = self.softmax(scores, dim=-1)
+        return torch.matmul(attention_weights, value)
+
+
+class self_attention(nn.Module):
+    def __init__(
+        self,
+        dim_model: int,
+        dim_key: int,
+        dot_product_attention=dot_product_attention,
+        **kwargs,
+    ):
+        if not dim_model > 0:
+            raise ValueError("embed_dim must be positive")
+        if not dim_key > 0:
+            raise ValueError("hidden_dim must be positive")
+        if not issubclass(dot_product_attention, nn.Module):
+            raise ValueError("dot_product_attention must be a subclass of nn.Module")
+        super(self_attention, self).__init__(**kwargs)
+        self.attention = dot_product_attention(dim_model, dim_key)
+
+    def forward(self, x, mask: Optional[torch.Tensor] = None):
+        """
+        the input should be a tensor with shape (seq_len, batch_size, embed_dim)
+        """
+        return self.attention(x, x, x, mask)
+
+
+class multi_head_attention(nn.Module):
+    def __init__(
+        self,
+        dim_model: int,
+        key_dim: int,
+        head_num: int,
+        self_attention=self_attention,
+        **kwargs,
+    ) -> None:
+        super(multi_head_attention, self).__init__(**kwargs)
+        self.head_num = head_num
+        self.emded2query = nn.ModuleList(
+            [nn.Linear(dim_model, key_dim, bias=False) for _ in range(self.head_num)]
+        )
+        self.emded2key = nn.ModuleList(
+            [nn.Linear(dim_model, key_dim, bias=False) for _ in range(self.head_num)]
+        )
+        self.emded2value = nn.ModuleList(
+            [nn.Linear(dim_model, dim_model, bias=False) for _ in range(self.head_num)]
+        )
+        self.self_attention = self_attention(dim_model, key_dim)
+
+    def forward(self, query, key, value, attention_mask: Optional[torch.Tensor] = None):
+        """
+        the input should be a tensor with shape (seq_len, batch_size, embed_dim)
+        """
+        attention_weights = [
+            self.self_attention(
+                self.emded2query[i](query),
+                self.emded2key[i](key),
+                self.emded2value[i](value),
+                attention_mask,
+            )
+            for i in range(self.head_num)
+        ]
+        return torch.cat(attention_weights, dim=-1)
+
+
+class possitional_encoding(nn.Module):
+    def __init__(self, dim_model: int, dropout: int, max_len: int = 1000) -> None:
+        super(possitional_encoding, self).__init__()
+        self.dropout = nn.Dropout(dropout)
+        P = torch.zeros((max_len, 1, dim_model))
+        position = torch.arange(max_len).unsqueeze(1)
+        P[:, 0, 0::2] = torch.sin(
+            position.float()
+            / torch.pow(10000, 2 * torch.arange(dim_model / 2).float() / dim_model)
+        )
+        P[:, 0, 1::2] = torch.cos(
+            position.float()
+            / torch.pow(10000, 2 * torch.arange(dim_model / 2).float() / dim_model)
+        )
+        self.register_buffer("P", P)
+
+    def forward(self, x):
+        """
+        the input should be a tensor with shape (seq_len, batch_size, embed_dim)
+        """
+        x = x + self.P[: x.size(0), :, :].to(x.device)  # type: ignore
+        return self.dropout(x)
+
+
+class transformer(nn.Module):
+    def __init__(
+        self,
+        max_len: int = 125,
+        dim_model: int = 512,
+        head_num: int = 8,
+        num_encoder_layers: int = 6,
+        num_decoder_layers: int = 6,
+        dim_feedforward: int = 2048,
+        dim_key: int = 64,
+        P_dropout: float = 0.1,
+        activation=F.relu,
+        layer_norm_eps: float = 1e-5,
+        **kwargs,
+    ) -> None:
+        super(transformer, self).__init__(**kwargs)
+        self.max_len = max_len
+        self.dim_model = dim_model
+        encoder_layer = transformer_encoder_layer(
+            dim_model,
+            head_num,
+            dim_feedforward,
+            dim_key,
+            P_dropout,
+            activation,
+            layer_norm_eps,
+        )
+        self.encoder = transformer_encoder(encoder_layer, num_encoder_layers)
+        decoder_layer = transformer_decoder_layer(
+            dim_model,
+            head_num,
+            dim_feedforward,
+            dim_key,
+            P_dropout,
+            activation,
+            layer_norm_eps,
+        )
+        self.decoder = transformer_decoder(decoder_layer, num_decoder_layers)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        memory: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        the input should be a tensor with shape (seq_len, batch_size, embed_dim)
+        """
+        x = self.encoder(x, attention_mask)
+        if memory is None:
+            memory = x
+        x = self.decoder(x, memory, attention_mask, memory_mask)
+        return x
+
+    def _init_memory(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        if self.training:
+            return torch.zeros(
+                (self.max_len, batch_size, self.dim_model), device=device
+            )
+        else:
+            return torch.randn(
+                (self.max_len, batch_size, self.dim_model), device=device
+            )
+
+
+class transformer_encoder(nn.Module):
+    def __init__(
+        self,
+        encoder_layer,
+        num_layers: int,
+        **kwargs,
+    ) -> None:
+        super(transformer_encoder, self).__init__(**kwargs)
+        self.layers = nn.ModuleList([encoder_layer for _ in range(num_layers)])
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, attention_mask)
+        return x
+
+
+class transformer_decoder(nn.Module):
+    def __init__(
+        self,
+        decoder_layer,
+        num_layers: int,
+        **kwargs,
+    ) -> None:
+        super(transformer_decoder, self).__init__(**kwargs)
+        self.layers = nn.ModuleList([decoder_layer for _ in range(num_layers)])
+
+    def forward(
+        self,
+        target: torch.Tensor,
+        memory: torch.Tensor,
+        target_mask: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            target = layer(target, memory, target_mask, memory_mask)
+        return target
+
+
+class transformer_encoder_layer(nn.Module):
+    def __init__(
+        self,
+        dim_model: int,
+        head_num: int,
+        dim_feedforward: int,
+        dim_key: int,
+        P_dropout: float,
+        activation,
+        layer_norm_eps: float,
+        **kaargs,
+    ) -> None:
+        super(transformer_encoder_layer, self).__init__(**kaargs)
+        self.self_attention = multi_head_attention(
+            dim_model, dim_key, head_num, self_attention
+        )
+        self.feed_forward = nn.Sequential(
+            nn.Linear(dim_model, dim_feedforward),
+            activation,
+            nn.Linear(dim_feedforward, dim_model),
+        )
+        self.layer_norm1 = nn.LayerNorm(dim_model, eps=layer_norm_eps)
+        self.layer_norm2 = nn.LayerNorm(dim_model, eps=layer_norm_eps)
+        self.dropout1 = nn.Dropout(P_dropout)
+        self.dropout2 = nn.Dropout(P_dropout)
+
+    def forward(
+        self,
+        x,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        the input should be a tensor with shape (seq_len, batch_size, embed_dim)
+        """
+        x = x + self.dropout1(self.self_attention(x, x, x, attention_mask))
+        x = self.layer_norm1(x)
+        x = x + self.dropout2(self.feed_forward(x))
+        x = self.layer_norm2(x)
+        return x
+
+
+class transformer_decoder_layer(nn.Module):
+    def __init__(
+        self,
+        dim_model: int,
+        head_num: int,
+        dim_feedforward: int,
+        dim_key: int,
+        P_dropout: float,
+        activation,
+        layer_norm_eps: float,
+        **kaargs,
+    ) -> None:
+        super(transformer_decoder_layer, self).__init__(**kaargs)
+        self.self_attention = multi_head_attention(
+            dim_model, dim_key, head_num, self_attention
+        )
+        self.cross_attention = multi_head_attention(
+            dim_model, dim_key, head_num, self_attention
+        )
+        self.feed_forward = nn.Sequential(
+            nn.Linear(dim_model, dim_feedforward),
+            activation,
+            nn.Linear(dim_feedforward, dim_model),
+        )
+        self.layer_norm1 = nn.LayerNorm(dim_model, eps=layer_norm_eps)
+        self.layer_norm2 = nn.LayerNorm(dim_model, eps=layer_norm_eps)
+        self.layer_norm3 = nn.LayerNorm(dim_model, eps=layer_norm_eps)
+        self.dropout1 = nn.Dropout(P_dropout)
+        self.dropout2 = nn.Dropout(P_dropout)
+        self.dropout3 = nn.Dropout(P_dropout)
+
+    def forward(
+        self,
+        target: torch.Tensor,
+        memory: torch.Tensor,
+        target_mask: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        target = target + self.dropout1(
+            self.self_attention(target, target, target, target_mask)
+        )
+        target = self.layer_norm1(target)
+        target = target + self.dropout2(
+            self.cross_attention(target, memory, memory, memory_mask)
+        )
+        target = self.layer_norm2(target)
+        target = target + self.dropout3(self.feed_forward(target))
+        target = self.layer_norm3(target)
+        return target
+
+
+class PoetryDataset(Dataset):
+    def __init__(self, poet_file, embed_dim: int = 512, max_len: Optional[int] = None):
+        super(PoetryDataset, self).__init__()
         self.max_len = max_len
         self.poet_data = np.load(poet_file, allow_pickle=True)["data"]
         self.word_to_ix = np.load(poet_file, allow_pickle=True)["word2ix"].item()
@@ -41,180 +357,6 @@ class PoetryDataSet(Dataset):
 
     def index(self, word: str):
         return self.word_to_ix[word]
-
-
-class RNN(nn.Module):
-    def __init__(
-        self, vocab_size: int, hidden_size: int, num_layers: int, **kwargs
-    ) -> None:
-        super(RNN, self).__init__(**kwargs)
-        self.vocab_size = vocab_size
-        self.rnn = nn.RNN(self.vocab_size, hidden_size)
-        self.output_layer = nn.Linear(hidden_size, self.vocab_size, num_layers)
-        if not self.rnn.bidirectional:
-            self.num_directions = 1
-            self.output_layer = nn.Linear(hidden_size, self.vocab_size)
-        else:
-            self.num_directions = 2
-            self.output_layer = nn.Linear(hidden_size * 2, self.vocab_size)
-
-    def forward(self, input_data, hidden_state):
-        input_data = F.one_hot(input_data.T.long(), self.vocab_size).float()
-        input_data = input_data.permute(1, 0, 2)  # 将batch_size放在第一维
-        input_data, new_hidden_state = self.rnn(input_data, hidden_state)
-
-        return self.output_layer(input_data), new_hidden_state
-
-    def init_state(self, batch_size, device=torch.device("cpu")):
-        return torch.randn(
-            (
-                self.num_directions * self.rnn.num_layers,
-                batch_size,
-                self.rnn.hidden_size,
-            ),
-            device=device,
-        )
-
-
-class GRU(nn.Module):
-    def __init__(
-        self, vocab_size: int, hidden_size: int, num_layers: int, **kwargs
-    ) -> None:
-        super(GRU, self).__init__()
-        self.vocab_size = vocab_size
-        self.gru = nn.GRU(self.vocab_size, hidden_size, num_layers)
-        self.output_layer = nn.Linear(hidden_size, self.vocab_size)
-        if not self.gru.bidirectional:
-            self.num_directions = 1
-            self.output_layer = nn.Linear(hidden_size, self.vocab_size)
-        else:
-            self.num_directions = 2
-            self.output_layer = nn.Linear(hidden_size * 2, self.vocab_size)
-
-    def forward(self, input_data, hidden_state):
-        input_data = F.one_hot(input_data.T.long(), self.vocab_size).float()
-        input_data = input_data.permute(1, 0, 2)  # 将batch_size放在第一维
-        input_data, new_hidden_state = self.gru(input_data, hidden_state)
-
-        return self.output_layer(input_data), new_hidden_state
-
-    def init_state(self, batch_size, device=torch.device("cpu")):
-        return torch.randn(
-            (
-                self.num_directions * self.gru.num_layers,
-                batch_size,
-                self.gru.hidden_size,
-            ),
-            device=device,
-        )
-
-
-class LSTM(nn.Module):
-    def __init__(
-        self, vocab_size: int, hidden_size: int, num_layers: int, **kwargs
-    ) -> None:
-        super(LSTM, self).__init__(**kwargs)
-        self.vocab_size = vocab_size
-        self.lstm = nn.LSTM(self.vocab_size, hidden_size, num_layers)
-        self.output_layer = nn.Linear(hidden_size, self.vocab_size)
-        if not self.lstm.bidirectional:
-            self.num_directions = 1
-            self.output_layer = nn.Linear(hidden_size, self.vocab_size)
-        else:
-            self.num_directions = 2
-            self.output_layer = nn.Linear(hidden_size * 2, self.vocab_size)
-
-    def forward(self, input, hidden_state):
-        input = F.one_hot(input.T.long(), self.vocab_size).float()
-        input = input.permute(1, 0, 2)  # 将batch_size放在第二维
-        input, new_hidden_state = self.lstm(input, hidden_state)
-
-        return self.output_layer(input), new_hidden_state
-
-    def init_state(self, batch_size, device=torch.device("cpu")):
-        return (
-            torch.randn(
-                (
-                    self.num_directions * self.lstm.num_layers,
-                    batch_size,
-                    self.lstm.hidden_size,
-                ),
-                device=device,
-            ),
-            torch.randn(
-                (
-                    self.num_directions * self.lstm.num_layers,
-                    batch_size,
-                    self.lstm.hidden_size,
-                ),
-                device=device,
-            ),
-        )
-
-
-class peephole_LSTM(nn.Module):
-    def __init__(
-        self, vocab_size: int, hidden_size: int, num_layers=1, **kwargs
-    ) -> None:
-        super(peephole_LSTM, self).__init__(**kwargs)
-        self.vocab_size = vocab_size
-        self.num_layers = num_layers
-        self.hidden_size = hidden_size
-        self.input2forgetgate = nn.Linear(vocab_size, hidden_size)
-        self.input2inputgate = nn.Linear(vocab_size, hidden_size)
-        self.input2outputgate = nn.Linear(vocab_size, hidden_size)
-        self.input2candidate = nn.Linear(vocab_size, hidden_size)
-        self.hidden2forgetgate = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.hidden2inputgate = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.hidden2outputgate = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.hidden2candidate = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.cell2forgetgate = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.cell2inputgate = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.cell2outputgate = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.cell2candidate = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.output_layer = nn.Linear(hidden_size, vocab_size)
-
-    def forward(self, input_data, hidden_state):
-        input_data = F.one_hot(input_data.T.long(), self.vocab_size).float()
-        input_data = input_data.permute(1, 0, 2)  # 将batch_size放在第二维
-        hidden_state, cell_state = hidden_state
-        all_hidden_state = torch.empty(
-            (0, input_data.shape[1], self.hidden_size), device=input_data.device
-        )
-        for time_t_input in input_data:
-            self.forgetgate = torch.sigmoid(
-                self.input2forgetgate(time_t_input)
-                + self.hidden2forgetgate(hidden_state)
-                + self.cell2forgetgate(cell_state)
-            )
-            self.inputgate = torch.sigmoid(
-                self.input2inputgate(time_t_input)
-                + self.hidden2inputgate(hidden_state)
-                + self.cell2inputgate(cell_state)
-            )
-            self.outputgate = torch.sigmoid(
-                self.input2outputgate(time_t_input)
-                + self.hidden2outputgate(hidden_state)
-                + self.cell2outputgate(cell_state)
-            )
-            candidate = torch.tanh(
-                self.input2candidate(time_t_input)
-                + self.hidden2candidate(hidden_state)
-                + self.cell2candidate(cell_state)
-            )
-            cell_state = self.forgetgate * cell_state + self.inputgate * candidate
-            hidden_state = self.outputgate * torch.tanh(cell_state)
-            all_hidden_state = torch.cat(
-                (all_hidden_state, hidden_state.unsqueeze(0)), dim=0
-            )
-
-        return self.output_layer(all_hidden_state), (hidden_state, cell_state)
-
-    def init_state(self, batch_size, device=torch.device("cpu")):
-        return (
-            torch.randn((batch_size, self.hidden_size), device=device),
-            torch.randn((batch_size, self.hidden_size), device=device),
-        )
 
 
 class poetry_model:
@@ -320,7 +462,7 @@ class poetry_model:
     def generate_poerty(
         self,
         start_words: str,
-        dataset: PoetryDataSet,
+        dataset: PoetryDataset,
         max_gen_len=200,
         model_dir="model",
         model_version=0,
@@ -357,7 +499,7 @@ class poetry_model:
     def generate_acrostic_poetry(
         self,
         start_words,
-        dataset: PoetryDataSet,
+        dataset: PoetryDataset,
         max_gen_len=200,
         model_dir="model",
         model_version=0,
@@ -396,14 +538,9 @@ class poetry_model:
         return generated_poetry.replace("<EOP>", "")
 
 
-if __name__ == "__main__":
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    os.chdir(BASE_DIR)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+def main():
     # 转换为Dataset与train_loader
-    poetry_dataset = PoetryDataSet(
+    poetry_dataset = PoetryDataset(
         poet_file="data/Poetry_data_word2ix_ix2word.npz", max_len=311600
     )
     train_loader = DataLoader(
@@ -411,19 +548,8 @@ if __name__ == "__main__":
     )
 
     # 定义模型
-    RNN_model = RNN(
-        vocab_size=poetry_dataset.vocab_size(), hidden_size=256, num_layers=1
-    )
-    GRU_model = GRU(
-        vocab_size=poetry_dataset.vocab_size(), hidden_size=256, num_layers=2
-    )
-    LSTM_model = LSTM(
-        vocab_size=poetry_dataset.vocab_size(), hidden_size=512, num_layers=1
-    )
-    peephole_LSTM_model = peephole_LSTM(
-        vocab_size=poetry_dataset.vocab_size(), hidden_size=512, num_layers=2
-    )
-    model = poetry_model(model=LSTM_model, epochs=500, device=device)
+    transformer_model = transformer()
+    model = poetry_model(model=transformer_model, epochs=500, device=device)
 
     # 模型训练
     model.train(train_loader, model_dir="model", save_frequency=10)
@@ -441,3 +567,7 @@ if __name__ == "__main__":
         start_words, poetry_dataset, model_dir="model", model_version=420
     )
     print(poetry)
+
+
+if __name__ == "__main__":
+    main()
